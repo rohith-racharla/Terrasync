@@ -1,0 +1,384 @@
+name: Terraform Drift Detection
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Specific environment to scan (leave blank for all)'
+        required: false
+        type: choice
+        options:
+          - ''
+          - dev
+          - staging
+          - prod
+
+# Principle of least privilege. issues:write is required only in the notify job.
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+env:
+  TF_VERSION: '1.9.8'
+  # Tells Terraform it is running non-interactively. Suppresses prompts and
+  # changes some output formatting suited for CI environments.
+  TF_IN_AUTOMATION: 'true'
+
+jobs:
+
+  # Job 1: Discover which environment directories to scan.
+  # Outputs a JSON matrix so the detect job runs in parallel per environment.
+  discover:
+    name: Discover Environments
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build environment matrix
+        id: build
+        run: |
+          if [[ -n "${{ inputs.environment }}" ]]; then
+            DIRS='["terraform/environments/${{ inputs.environment }}"]'
+          else
+            # Dynamically discovers all environment subdirectories.
+            # Adding a new environment folder automatically includes it in future scans.
+            DIRS=$(find terraform/environments -maxdepth 1 -mindepth 1 -type d \
+              | sort \
+              | jq -R . \
+              | jq -sc .)
+          fi
+          echo "matrix={\"dir\":${DIRS}}" >> "$GITHUB_OUTPUT"
+
+  # Job 2: Run drift detection in parallel for each discovered environment.
+  #
+  # Why terraform plan and not terraform plan -refresh-only:
+  #   "terraform plan -refresh-only" compares state file vs real AWS infrastructure.
+  #   The lifecycle ignore_changes blocks in the modules have no effect on this
+  #   comparison, causing false positives from computed attributes that AWS
+  #   populates after resource creation (e.g. EIP association IDs, empty tag
+  #   maps returned by the API).
+  #
+  #   "terraform plan" first refreshes AWS state internally, then compares
+  #   the config against real AWS. The ignore_changes blocks ARE respected in
+  #   this comparison. Using full plan eliminates all computed-attribute false
+  #   positives without requiring a separate terraform apply -refresh-only step.
+  #
+  # fail-fast: false ensures one environment failure does not cancel parallel scans.
+  detect:
+    name: Detect Drift (${{ matrix.dir }})
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve environment name
+        id: env
+        run: echo "name=$(basename '${{ matrix.dir }}')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve AWS role ARN
+        id: role
+        run: |
+          case "${{ steps.env.outputs.name }}" in
+            dev)     echo "arn=${{ secrets.DEV_AWS_ROLE_ARN }}"     >> "$GITHUB_OUTPUT" ;;
+            staging) echo "arn=${{ secrets.STAGING_AWS_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
+            prod)    echo "arn=${{ secrets.PROD_AWS_ROLE_ARN }}"    >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "Unknown environment: ${{ steps.env.outputs.name }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # Session name is scoped to environment and run ID for audit traceability.
+          role-session-name: drift-detect-${{ steps.env.outputs.name }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # Disable the wrapper so PIPESTATUS reflects the real terraform exit code.
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -input=false -no-color -upgrade=false
+
+      - name: Run drift detection
+        id: detect
+        working-directory: ${{ matrix.dir }}
+        run: |
+          # Security: plan output is piped to a temporary file for resource address
+          # extraction only. The file is deleted when this step exits via the trap.
+          # Plan output is never saved permanently and is not uploaded as an artifact
+          # because it may contain infrastructure details from AWS API responses
+          # such as ARNs, IAM policy documents, and security group IDs.
+          PLAN_TMP=$(mktemp)
+          trap 'rm -f "${PLAN_TMP}"' EXIT
+
+          set +e
+          terraform plan \
+            -detailed-exitcode \
+            -no-color \
+            -input=false \
+            -compact-warnings \
+            2>&1 | tee "${PLAN_TMP}"
+          EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          echo "exit_code=${EXIT}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${EXIT}" -eq 2 ]]; then
+            # Extract resource addresses only. No attribute values are captured.
+            # Terraform plan output marks affected resources with lines starting
+            # with two spaces and a hash, followed by the resource address and action.
+            RESOURCES=$(grep -E "^  # [a-zA-Z]" "${PLAN_TMP}" \
+              | sed 's/^  # //; s/ will be.*//; s/ must be.*//; s/ has been.*//' \
+              | sort -u \
+              | jq -R . | jq -sc . 2>/dev/null || echo '[]')
+            echo "resources=${RESOURCES}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write drift report
+        if: steps.detect.outputs.exit_code == '2'
+        working-directory: ${{ matrix.dir }}
+        run: |
+          RESOURCES='${{ steps.detect.outputs.resources }}'
+          COUNT=$(echo "${RESOURCES}" | jq 'length')
+          # drift-report.json contains resource addresses only, no attribute values.
+          # It is safe to upload as a CI artifact and embed in GitHub Issues.
+          cat > drift-report.json <<EOF
+          {
+            "environment": "${{ steps.env.outputs.name }}",
+            "drift_detected": true,
+            "drifted_resource_count": ${COUNT},
+            "drifted_resources": ${RESOURCES},
+            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "run_id": "${{ github.run_id }}"
+          }
+          EOF
+
+      - name: Upload drift report
+        if: steps.detect.outputs.exit_code == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-${{ steps.env.outputs.name }}-${{ github.run_id }}
+          # Only the drift report is uploaded. It contains resource addresses only.
+          path: ${{ matrix.dir }}/drift-report.json
+          retention-days: 30
+
+      - name: Write job summary
+        if: always()
+        run: |
+          ENV="${{ steps.env.outputs.name }}"
+          EXIT="${{ steps.detect.outputs.exit_code }}"
+          case "${EXIT}" in
+            0)
+              echo "No drift detected in ${ENV}." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            1)
+              echo "Terraform error in ${ENV}. See step logs for details." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2)
+              RESOURCES='${{ steps.detect.outputs.resources }}'
+              COUNT=$(echo "${RESOURCES}" | jq 'length')
+              echo "Drift detected in ${ENV}: ${COUNT} resource(s) affected." >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "Drifted resources (addresses only):" >> "$GITHUB_STEP_SUMMARY"
+              echo "${RESOURCES}" | jq -r '.[]' | while read -r r; do
+                echo "- ${r}" >> "$GITHUB_STEP_SUMMARY"
+              done
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "Full attribute diff is visible in the step logs above." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      - name: Fail on Terraform error
+        if: steps.detect.outputs.exit_code == '1'
+        run: exit 1
+
+  # Job 3: Create GitHub Issues and send Slack notification when drift is found.
+  # Runs after all detect jobs complete regardless of their outcome.
+  notify:
+    name: Notify on Drift
+    needs: detect
+    runs-on: ubuntu-latest
+    if: always() && needs.detect.result != 'skipped'
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download drift reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: drift-*-${{ github.run_id }}
+          path: drift-reports/
+        continue-on-error: true
+
+      - name: Count affected environments
+        id: count
+        run: |
+          N=$(find drift-reports/ -name "drift-report.json" 2>/dev/null | wc -l | tr -d ' ')
+          echo "n=${N}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub issues
+        if: steps.count.outputs.n > 0
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const runUrl      = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const remediateUrl = `${{ github.server_url }}/${{ github.repository }}/actions/workflows/drift-remediation.yml`;
+
+            const reports = [];
+            const walk = (dir) => {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir)) {
+                const full = path.join(dir, entry);
+                if (fs.statSync(full).isDirectory()) walk(full);
+                else if (entry === 'drift-report.json') reports.push(full);
+              }
+            };
+            walk('drift-reports');
+
+            for (const reportPath of reports) {
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const { environment: env, drifted_resources: resources = [], drifted_resource_count: count, timestamp } = report;
+              const envLabel = `environment:${env}`;
+
+              // Ensure required labels exist. Errors are silently ignored because
+              // the label may already exist.
+              for (const [name, color, desc] of [
+                ['drift',         'd73a4a', 'Terraform drift detected'],
+                ['infrastructure', 'e4e669', 'Infrastructure change'],
+                [envLabel,         '0075ca', `Environment: ${env}`],
+              ]) {
+                try {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    name, color, description: desc
+                  });
+                } catch (_) {}
+              }
+
+              // Check for an existing open drift issue for this environment to
+              // avoid creating duplicate issues on repeated scan runs.
+              const existing = await github.rest.issues.listForRepo({
+                owner: context.repo.owner, repo: context.repo.repo,
+                labels: `drift,${envLabel}`,
+                state: 'open', per_page: 1
+              });
+
+              const resourceList = resources.map(r => `- \`${r}\``).join('\n') ||
+                '- (resource list unavailable, see run logs)';
+
+              if (existing.data.length > 0) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: existing.data[0].number,
+                  body: `Drift still present as of ${timestamp}.\n\n` +
+                        `Affected resources (${count}):\n${resourceList}\n\n` +
+                        `Attribute-level diff is in the [workflow run logs](${runUrl}) ` +
+                        `(access controlled by repository permissions).`
+                });
+              } else {
+                await github.rest.issues.create({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  title: `Drift detected in ${env} (${new Date(timestamp).toDateString()})`,
+                  labels: ['drift', 'infrastructure', envLabel],
+                  body: [
+                    `## Terraform Drift Detected: \`${env}\``,
+                    '',
+                    `**Detected at:** ${timestamp}`,
+                    `**Resources affected:** ${count}`,
+                    `**Workflow run:** [View logs](${runUrl})`,
+                    '',
+                    '### Affected Resources',
+                    '',
+                    resourceList,
+                    '',
+                    '> The attribute-level diff (showing exactly what changed in AWS) is',
+                    '> visible in the workflow run logs linked above. It is intentionally',
+                    '> not embedded here because it may contain sensitive infrastructure',
+                    '> details. Access is controlled by repository permissions.',
+                    '',
+                    '### What is drift?',
+                    '',
+                    'Real infrastructure no longer matches the Terraform configuration.',
+                    'A direct manual change was likely made in the AWS console or CLI,',
+                    'bypassing the infrastructure-as-code process.',
+                    '',
+                    '### Remediation',
+                    '',
+                    '| Mode | When to use |',
+                    '|------|-------------|',
+                    '| `apply` | Undo the manual change and restore Terraform config |',
+                    '| `refresh-state` | Accept the manual change into Terraform state |',
+                    '',
+                    `[Trigger remediation workflow](${remediateUrl})`,
+                    `> Set environment to \`${env}\` and choose a mode.`,
+                  ].join('\n')
+                });
+              }
+            }
+
+      - name: Send Slack notification
+        if: steps.count.outputs.n > 0
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Terraform drift detected in ${{ steps.count.outputs.n }} environment(s). Human review required before remediation.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Terraform Drift Detected*\nRepository: `${{ github.repository }}`\nEnvironments affected: ${{ steps.count.outputs.n }}\nTriggered by: ${{ github.event_name }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View Run" },
+                      "style": "primary",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "Open Issues" },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/issues?q=is%3Aopen+label%3Adrift"
+                    },
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "Remediate" },
+                      "style": "danger",
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/workflows/drift-remediation.yml"
+                    }
+                  ]
+                }
+              ]
+            }

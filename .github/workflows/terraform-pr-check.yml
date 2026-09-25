@@ -1,0 +1,261 @@
+name: Terraform PR Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.9.8'
+  TF_IN_AUTOMATION: 'true'
+
+# Job 1: Determine which environment directories are affected by this PR.
+# A change to a shared module triggers validation for all environments because
+# any environment that calls the module may be affected.
+jobs:
+  detect-changes:
+    name: Detect Affected Environments
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      has_environments: ${{ steps.build-matrix.outputs.has_environments }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changed
+        uses: tj-actions/changed-files@v45
+        with:
+          files_yaml: |
+            dev:
+              - 'terraform/environments/dev/**'
+            staging:
+              - 'terraform/environments/staging/**'
+            prod:
+              - 'terraform/environments/prod/**'
+            shared_modules:
+              - 'terraform/modules/**'
+            bootstrap:
+              - 'terraform/bootstrap/**'
+
+      - name: Build environment matrix
+        id: build-matrix
+        run: |
+          ENVS=()
+
+          if [[ "${{ steps.changed.outputs.shared_modules_any_changed }}" == "true" ]] || \
+             [[ "${{ steps.changed.outputs.bootstrap_any_changed }}" == "true" ]]; then
+            echo "Shared module or bootstrap change detected. Validating all environments."
+            ENVS=("terraform/environments/dev" "terraform/environments/staging" "terraform/environments/prod")
+          else
+            [[ "${{ steps.changed.outputs.dev_any_changed }}"     == "true" ]] && ENVS+=("terraform/environments/dev")
+            [[ "${{ steps.changed.outputs.staging_any_changed }}" == "true" ]] && ENVS+=("terraform/environments/staging")
+            [[ "${{ steps.changed.outputs.prod_any_changed }}"    == "true" ]] && ENVS+=("terraform/environments/prod")
+          fi
+
+          if [[ ${#ENVS[@]} -eq 0 ]]; then
+            echo "No Terraform environment changes detected in this PR."
+            echo 'matrix={"environment":[]}' >> "$GITHUB_OUTPUT"
+            echo "has_environments=false"    >> "$GITHUB_OUTPUT"
+          else
+            MATRIX=$(printf '%s\n' "${ENVS[@]}" | jq -R . | jq -sc .)
+            echo "Affected environments: ${MATRIX}"
+            echo "matrix={\"environment\":${MATRIX}}" >> "$GITHUB_OUTPUT"
+            echo "has_environments=true"              >> "$GITHUB_OUTPUT"
+          fi
+
+# Job 2: Run format check, init, validate, and plan for each affected environment.
+# fail-fast: false ensures all environments are checked even if one fails.
+  terraform-checks:
+    name: Terraform Checks (${{ matrix.environment }})
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_environments == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve environment name
+        id: env
+        run: echo "name=$(basename '${{ matrix.environment }}')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve AWS role ARN
+        id: role
+        run: |
+          case "${{ steps.env.outputs.name }}" in
+            dev)     echo "arn=${{ secrets.DEV_AWS_ROLE_ARN }}"     >> "$GITHUB_OUTPUT" ;;
+            staging) echo "arn=${{ secrets.STAGING_AWS_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
+            prod)    echo "arn=${{ secrets.PROD_AWS_ROLE_ARN }}"    >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: pr-check-${{ steps.env.outputs.name }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format check
+        id: fmt
+        run: terraform fmt -check -recursive terraform/
+        continue-on-error: true
+
+      - name: Init
+        id: init
+        working-directory: ${{ matrix.environment }}
+        run: terraform init -input=false -no-color -upgrade=false
+        continue-on-error: true
+
+      - name: Validate
+        id: validate
+        working-directory: ${{ matrix.environment }}
+        run: terraform validate -no-color
+        continue-on-error: true
+
+      # Security: plan output may contain infrastructure details from AWS API responses.
+      # It is piped to a temporary file for inclusion in the PR comment only, then
+      # deleted when the step exits via the trap. No plan file or artifact is uploaded.
+      - name: Plan
+        id: plan
+        working-directory: ${{ matrix.environment }}
+        run: |
+          PLAN_TMP=$(mktemp)
+          trap 'rm -f "${PLAN_TMP}"' EXIT
+
+          set +e
+          terraform plan -no-color -input=false -compact-warnings 2>&1 | tee "${PLAN_TMP}"
+          PLAN_EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          echo "exit_code=${PLAN_EXIT}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${PLAN_EXIT}" -eq 0 ]]; then
+            echo "plan_status=No changes" >> "$GITHUB_OUTPUT"
+          elif [[ "${PLAN_EXIT}" -eq 2 ]]; then
+            echo "plan_status=Changes pending" >> "$GITHUB_OUTPUT"
+          else
+            echo "plan_status=Error" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Pass plan output to the PR comment step via a file in RUNNER_TEMP.
+          # RUNNER_TEMP is isolated to this job and cleaned up after the run.
+          cp "${PLAN_TMP}" "${RUNNER_TEMP}/plan_output_${{ steps.env.outputs.name }}.txt"
+        continue-on-error: true
+
+      - name: Post plan summary as PR comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs  = require('fs');
+            const env = '${{ steps.env.outputs.name }}';
+
+            const outcomes = {
+              fmt:      '${{ steps.fmt.outcome }}',
+              init:     '${{ steps.init.outcome }}',
+              validate: '${{ steps.validate.outcome }}',
+              plan:     '${{ steps.plan.outputs.plan_status }}'
+            };
+
+            const result = (outcome) => outcome === 'success' ? 'passed' : 'failed';
+
+            let planOutput = '(plan output not available)';
+            try {
+              const raw = fs.readFileSync(
+                `${process.env.RUNNER_TEMP}/plan_output_${env}.txt`, 'utf8'
+              );
+              // Truncate at 60000 chars to stay within GitHub comment limits.
+              planOutput = raw.length > 60000
+                ? raw.substring(0, 60000) + '\n\n[output truncated — see full output in the workflow run logs]'
+                : raw;
+            } catch (_) {}
+
+            const body = [
+              `## Terraform Plan: \`${env}\``,
+              '',
+              '| Check | Result |',
+              '|-------|--------|',
+              `| Format (\`terraform fmt\`) | ${result(outcomes.fmt)} |`,
+              `| Init | ${result(outcomes.init)} |`,
+              `| Validate | ${result(outcomes.validate)} |`,
+              `| Plan | ${outcomes.plan} |`,
+              '',
+              '<details>',
+              '<summary>Show plan output</summary>',
+              '',
+              '```',
+              planOutput,
+              '```',
+              '',
+              '</details>',
+              '',
+              '---',
+              `Actor: @${{ github.actor }} | [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            // Update an existing bot comment for this environment rather than
+            // creating a new one on each commit push. Keeps the PR comment thread clean.
+            const marker = `Terraform Plan: \`${env}\``;
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exit_code == '1'
+        run: exit 1
+
+# Job 3: Static security analysis of all Terraform files.
+# Runs on every PR regardless of which files changed.
+  security-scan:
+    name: Security Scan (tfsec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-pr-commenter-action@v1.3.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tfsec_args: --no-color --minimum-severity MEDIUM
+        continue-on-error: true

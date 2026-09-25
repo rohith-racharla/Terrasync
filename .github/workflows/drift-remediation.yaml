@@ -1,0 +1,257 @@
+name: Terraform Drift Remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to remediate'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      mode:
+        description: 'Remediation mode'
+        required: true
+        type: choice
+        options:
+          - plan-only
+          - apply
+          - refresh-state
+      confirmation:
+        description: 'Type REMEDIATE to confirm (required for apply and refresh-state)'
+        required: true
+        type: string
+      reason:
+        description: 'Reason for remediation (recorded in the job summary for audit purposes)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+env:
+  TF_VERSION: '1.9.8'
+  TF_IN_AUTOMATION: 'true'
+
+jobs:
+
+  # Job 1: Validate the confirmation token before any Terraform operation runs.
+  # plan-only is exempt from confirmation because it makes no changes.
+  safety-gate:
+    name: Safety Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          MODE="${{ inputs.mode }}"
+          CONFIRMATION="${{ inputs.confirmation }}"
+          if [[ "${MODE}" != "plan-only" && "${CONFIRMATION}" != "REMEDIATE" ]]; then
+            echo "Confirmation required for mode '${MODE}'."
+            echo "Expected: REMEDIATE"
+            echo "Re-run the workflow and enter REMEDIATE in the confirmation field."
+            exit 1
+          fi
+
+      - name: Write audit record
+        run: |
+          echo "Remediation request details:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Environment | \`${{ inputs.environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Mode | \`${{ inputs.mode }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Requested by | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Reason | ${{ inputs.reason }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Timestamp | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |" >> "$GITHUB_STEP_SUMMARY"
+
+  # Job 2: Run the chosen remediation mode.
+  #
+  # Modes:
+  #   plan-only      Pre-flight check. Shows what Terraform would change. No write operations.
+  #   apply          Enforces Terraform config against AWS. Overwrites manual changes.
+  #   refresh-state  Updates the Terraform state file to match current AWS reality without
+  #                  changing any real resources. Use this to accept a manual change as the
+  #                  new desired state (terraform apply -refresh-only).
+  #
+  # Security: all Terraform output (plan, apply, refresh) goes to runner logs only.
+  # No plan files are saved (-out is not used). No artifacts are uploaded.
+  # Runner logs are access-controlled by GitHub repository permissions.
+  remediate:
+    name: Remediate (${{ inputs.environment }}, ${{ inputs.mode }})
+    needs: safety-gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve AWS role ARN
+        id: role
+        run: |
+          case "${{ inputs.environment }}" in
+            dev)     echo "arn=${{ secrets.DEV_AWS_ROLE_ARN }}"     >> "$GITHUB_OUTPUT" ;;
+            staging) echo "arn=${{ secrets.STAGING_AWS_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
+            prod)    echo "arn=${{ secrets.PROD_AWS_ROLE_ARN }}"    >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: drift-remediate-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: terraform init -input=false -no-color -upgrade=false
+
+      # Pre-flight drift check. Shows what is out of sync before any changes are made.
+      # Output goes to runner logs. No plan binary is saved.
+      - name: Pre-flight drift check
+        id: preflight
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -input=false -compact-warnings 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: No drift found
+        if: steps.preflight.outputs.exit_code == '0'
+        run: |
+          echo "No drift detected in ${{ inputs.environment }}. No action required."
+          echo "No drift found. Remediation skipped." >> "$GITHUB_STEP_SUMMARY"
+
+      # plan-only mode ends here. The pre-flight output above is the deliverable.
+      - name: Plan-only complete
+        if: inputs.mode == 'plan-only' && steps.preflight.outputs.exit_code == '2'
+        run: |
+          echo "Plan-only run complete for ${{ inputs.environment }}."
+          echo "Review the pre-flight output above before triggering apply or refresh-state."
+          echo "Plan-only complete. Review the output above." >> "$GITHUB_STEP_SUMMARY"
+
+      # apply mode: enforce the Terraform configuration, overwriting manual changes.
+      - name: Apply
+        if: inputs.mode == 'apply' && steps.preflight.outputs.exit_code == '2'
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: terraform apply -auto-approve -no-color -input=false 2>&1
+
+      # refresh-state mode: sync the state file with current AWS reality without
+      # modifying any real resources. This is the correct way to accept a manual
+      # change into Terraform state (terraform apply -refresh-only).
+      - name: Refresh state
+        if: inputs.mode == 'refresh-state' && steps.preflight.outputs.exit_code == '2'
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: terraform apply -refresh-only -auto-approve -no-color -input=false 2>&1
+
+      # Post-remediation check: verify the environment is clean after apply or refresh.
+      # Runs only when a remediation action was taken (not plan-only, not already clean).
+      - name: Post-remediation drift check
+        id: postcheck
+        if: inputs.mode != 'plan-only' && steps.preflight.outputs.exit_code == '2'
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -input=false -compact-warnings 2>&1
+          POST_EXIT=$?
+          echo "exit_code=${POST_EXIT}" >> "$GITHUB_OUTPUT"
+          set -e
+
+          if [[ "${POST_EXIT}" -eq 0 ]]; then
+            echo "Post-remediation check passed. ${{ inputs.environment }} is clean." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Post-remediation check failed. Drift persists in ${{ inputs.environment }}." >> "$GITHUB_STEP_SUMMARY"
+            echo "Manual investigation is required. See post-check output above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Close open drift issues for this environment when the post-check is clean.
+      - name: Close resolved GitHub issues
+        if: steps.postcheck.outputs.exit_code == '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const env = '${{ inputs.environment }}';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: `drift,environment:${env}`,
+              state: 'open'
+            });
+
+            for (const issue of issues) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: [
+                  'Drift resolved.',
+                  '',
+                  `Resolved by: @${{ github.actor }}`,
+                  `Mode: \`${{ inputs.mode }}\``,
+                  `Reason: ${{ inputs.reason }}`,
+                  `Resolved at: ${new Date().toISOString()}`,
+                  `Run: [${{ github.run_number }}](${runUrl})`,
+                ].join('\n')
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed'
+              });
+              console.log(`Closed issue #${issue.number} for environment: ${env}`);
+            }
+
+      - name: Slack notification (remediation complete)
+        if: steps.postcheck.outputs.exit_code == '0'
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Drift remediated in ${{ inputs.environment }}.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Drift Remediated*\nEnvironment: `${{ inputs.environment }}`\nMode: `${{ inputs.mode }}`\nBy: ${{ github.actor }}\nReason: ${{ inputs.reason }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                  }
+                }
+              ]
+            }
+
+      - name: Slack notification (drift persists)
+        if: steps.postcheck.outputs.exit_code != '0' && steps.postcheck.outputs.exit_code != ''
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Remediation incomplete. Drift persists in ${{ inputs.environment }}. Manual investigation required.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Remediation Incomplete*\nEnvironment: `${{ inputs.environment }}`\nDrift still detected after `${{ inputs.mode }}` by ${{ github.actor }}.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run logs>"
+                  }
+                }
+              ]
+            }
