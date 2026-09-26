@@ -1,8 +1,8 @@
 name: Terraform Drift Detection
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
+  # schedule:
+    # - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       environment:
@@ -15,11 +15,9 @@ on:
           - staging
           - prod
 
-# Principle of least privilege. issues:write is required only in the notify job.
-permissions:
-  contents: read
-  id-token: write
-  issues: write
+# No permissions are granted at the workflow level. Each job below
+# requests only what it actually needs (principle of least privilege).
+permissions: {}
 
 env:
   TF_VERSION: '1.9.8'
@@ -34,17 +32,21 @@ jobs:
   discover:
     name: Discover Environments
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build environment matrix
         id: build
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          if [[ -n "${{ inputs.environment }}" ]]; then
-            DIRS='["terraform/environments/${{ inputs.environment }}"]'
+          if [[ -n "${INPUT_ENVIRONMENT}}" ]]; then
+            DIRS=$(jq -nc --arg e "${INPUT_ENVIRONMENT}" '["terraform/environments/\($e)"]')
           else
             # Dynamically discovers all environment subdirectories.
             # Adding a new environment folder automatically includes it in future scans.
@@ -74,12 +76,21 @@ jobs:
     name: Detect Drift (${{ matrix.dir }})
     needs: discover
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # only this job assumes an AWS role via OIDC
     strategy:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
       fail-fast: false
+    concurrency:
+      # Prevents two overlapping scheduled/manual runs
+      # from racing on the same environment.
+      group: drift-detect-${{ matrix.dir }}
+      cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve environment name
         id: env
@@ -87,13 +98,15 @@ jobs:
 
       - name: Resolve AWS role ARN
         id: role
+        env:
+          ENV_NAME: ${{ steps.env.outputs.name }}
         run: |
-          case "${{ steps.env.outputs.name }}" in
+          case "${ENV_NAME}" in
             dev)     echo "arn=${{ secrets.DEV_AWS_ROLE_ARN }}"     >> "$GITHUB_OUTPUT" ;;
             staging) echo "arn=${{ secrets.STAGING_AWS_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
             prod)    echo "arn=${{ secrets.PROD_AWS_ROLE_ARN }}"    >> "$GITHUB_OUTPUT" ;;
             *)
-              echo "Unknown environment: ${{ steps.env.outputs.name }}"
+              echo "Unknown environment: ${ENV_NAME}"
               exit 1
               ;;
           esac
@@ -222,7 +235,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download drift reports
         uses: actions/download-artifact@v4
@@ -325,7 +338,7 @@ jobs:
                     '',
                     'Real infrastructure no longer matches the Terraform configuration.',
                     'A direct manual change was likely made in the AWS console or CLI,',
-                    'bypassing the infrastructure-as-code process.',
+                    'bypassing the Infrastructure-as-Code process.',
                     '',
                     '### Remediation',
                     '',

@@ -7,10 +7,7 @@ on:
     paths:
       - 'terraform/**'
 
-permissions:
-  contents: read
-  id-token: write
-  pull-requests: write
+permissions: {}
 
 env:
   TF_VERSION: '1.9.8'
@@ -23,18 +20,25 @@ jobs:
   detect-changes:
     name: Detect Affected Environments
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      # A new push to the PR supersedes any in-progress detection for the old commit.
+      group: terraform-drift-detection-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
       has_environments: ${{ steps.build-matrix.outputs.has_environments }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Detect changed files
         id: changed
-        uses: tj-actions/changed-files@v45
+        uses: tj-actions/changed-files@v46.0.1
         with:
           files_yaml: |
             dev:
@@ -50,17 +54,22 @@ jobs:
 
       - name: Build environment matrix
         id: build-matrix
+        env:
+          SHARED_CHANGED: ${{ steps.changed.outputs.shared_modules_any_changed }}
+          BOOTSTRAP_CHANGED: ${{ steps.changed.outputs.bootstrap_any_changed }}
+          DEV_CHANGED: ${{ steps.changed.outputs.dev_any_changed }}
+          STAGING_CHANGED: ${{ steps.changed.outputs.staging_any_changed }}
+          PROD_CHANGED: ${{ steps.changed.outputs.prod_any_changed }}
         run: |
           ENVS=()
 
-          if [[ "${{ steps.changed.outputs.shared_modules_any_changed }}" == "true" ]] || \
-             [[ "${{ steps.changed.outputs.bootstrap_any_changed }}" == "true" ]]; then
+          if [[ "${SHARED_CHANGED}" == "true" ]] || [[ "${BOOTSTRAP_CHANGED}" == "true" ]]; then
             echo "Shared module or bootstrap change detected. Validating all environments."
             ENVS=("terraform/environments/dev" "terraform/environments/staging" "terraform/environments/prod")
           else
-            [[ "${{ steps.changed.outputs.dev_any_changed }}"     == "true" ]] && ENVS+=("terraform/environments/dev")
-            [[ "${{ steps.changed.outputs.staging_any_changed }}" == "true" ]] && ENVS+=("terraform/environments/staging")
-            [[ "${{ steps.changed.outputs.prod_any_changed }}"    == "true" ]] && ENVS+=("terraform/environments/prod")
+            [[ "${DEV_CHANGED}"     == "true" ]] && ENVS+=("terraform/environments/dev")
+            [[ "${STAGING_CHANGED}" == "true" ]] && ENVS+=("terraform/environments/staging")
+            [[ "${PROD_CHANGED}"    == "true" ]] && ENVS+=("terraform/environments/prod")
           fi
 
           if [[ ${#ENVS[@]} -eq 0 ]]; then
@@ -81,12 +90,19 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.has_environments == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
     strategy:
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
       fail-fast: false
+    concurrency:
+      group: terraform-pr-check-${{ github.event.pull_request.number }}-${{ matrix.environment }}
+      cancel-in-progress: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve environment name
         id: env
@@ -94,11 +110,17 @@ jobs:
 
       - name: Resolve AWS role ARN
         id: role
+        env:
+          ENV_NAME: ${{ steps.env.outputs.name }}
         run: |
-          case "${{ steps.env.outputs.name }}" in
+          case "${ENV_NAME}" in
             dev)     echo "arn=${{ secrets.DEV_AWS_ROLE_ARN }}"     >> "$GITHUB_OUTPUT" ;;
             staging) echo "arn=${{ secrets.STAGING_AWS_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
             prod)    echo "arn=${{ secrets.PROD_AWS_ROLE_ARN }}"    >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "Unknown environment: ${ENV_NAME}"
+              exit 1
+              ;;
           esac
 
       - name: Configure AWS credentials
@@ -185,9 +207,11 @@ jobs:
               );
               // Truncate at 60000 chars to stay within GitHub comment limits.
               planOutput = raw.length > 60000
-                ? raw.substring(0, 60000) + '\n\n[output truncated — see full output in the workflow run logs]'
+                ? raw.substring(0, 60000) + '\n\n[output truncated - see full output in the workflow run logs]'
                 : raw;
             } catch (_) {}
+
+            planOutput = planOutput.replace(/```/g, '``\u200b`');
 
             const body = [
               `## Terraform Plan: \`${env}\``,
@@ -245,13 +269,24 @@ jobs:
         if: steps.plan.outputs.exit_code == '1'
         run: exit 1
 
+      - name: Fail if validate errored
+        if: steps.validate.outcome == 'failure'
+        run: exit 1
+
 # Job 3: Static security analysis of all Terraform files.
 # Runs on every PR regardless of which files changed.
   security-scan:
     name: Security Scan (tfsec)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: terraform-pr-tfsec-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Run tfsec
         uses: aquasecurity/tfsec-pr-commenter-action@v1.3.1

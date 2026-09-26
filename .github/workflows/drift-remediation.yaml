@@ -28,10 +28,7 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  id-token: write
-  issues: write
+permissions: {}
 
 env:
   TF_VERSION: '1.9.8'
@@ -44,12 +41,15 @@ jobs:
   safety-gate:
     name: Safety Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
 
     steps:
       - name: Validate confirmation
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRMATION: ${{ inputs.confirmation }}
         run: |
-          MODE="${{ inputs.mode }}"
-          CONFIRMATION="${{ inputs.confirmation }}"
           if [[ "${MODE}" != "plan-only" && "${CONFIRMATION}" != "REMEDIATE" ]]; then
             echo "Confirmation required for mode '${MODE}'."
             echo "Expected: REMEDIATE"
@@ -58,16 +58,23 @@ jobs:
           fi
 
       - name: Write audit record
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          MODE: ${{ inputs.mode }}
+          ACTOR: ${{ github.actor }}
+          REASON: ${{ inputs.reason }}
         run: |
-          echo "Remediation request details:" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Environment | \`${{ inputs.environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Mode | \`${{ inputs.mode }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Requested by | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Reason | ${{ inputs.reason }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Timestamp | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Remediation request details:"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Environment | \`${ENVIRONMENT}\` |"
+            echo "| Mode | \`${MODE}\` |"
+            echo "| Requested by | @${ACTOR} |"
+            echo "| Reason | ${REASON} |"
+            echo "| Timestamp | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Job 2: Run the chosen remediation mode.
   #
@@ -85,17 +92,34 @@ jobs:
     name: Remediate (${{ inputs.environment }}, ${{ inputs.mode }})
     needs: safety-gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # for OIDC -> AWS role assumption
+      issues: write # for closing resolved drift issues
+    environment: ${{ inputs.environment }}
+    concurrency:
+      # Prevents two remediation runs (or a remediation and a concurrent apply)
+      # from racing against the same environment's state.
+      group: drift-remediate-${{ inputs.environment }}
+      cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve AWS role ARN
         id: role
+        env:
+          ENVIRONMENT: ${{inputs.environment }}
         run: |
-          case "${{ inputs.environment }}" in
+          case "${ENVIRONMENT}" in
             dev)     echo "arn=${{ secrets.DEV_AWS_ROLE_ARN }}"     >> "$GITHUB_OUTPUT" ;;
             staging) echo "arn=${{ secrets.STAGING_AWS_ROLE_ARN }}" >> "$GITHUB_OUTPUT" ;;
             prod)    echo "arn=${{ secrets.PROD_AWS_ROLE_ARN }}"    >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "Unknown environment: ${ENVIRONMENT}"
+              exit 1
+              ;;
           esac
 
       - name: Configure AWS credentials
@@ -178,10 +202,18 @@ jobs:
       - name: Close resolved GitHub issues
         if: steps.postcheck.outputs.exit_code == '0'
         uses: actions/github-script@v7
+        env:
+          REMEDIATION_ENV: ${{ inputs.environment }}
+          REMEDIATION_MODE: ${{ inputs.mode }}
+          REMEDIATION_REASON: ${{ inputs.reason }}
+          REMEDIATION_ACTOR: ${{ github.actor }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const env = '${{ inputs.environment }}';
+            const env = process.env.REMEDIATION_ENV;
+            const mode = process.env.REMEDIATION_MODE;
+            const reason = process.env.REMEDIATION_REASON;
+            const actor = process.env.REMEDIATION_ACTOR;
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
 
             const { data: issues } = await github.rest.issues.listForRepo({
@@ -216,25 +248,79 @@ jobs:
               console.log(`Closed issue #${issue.number} for environment: ${env}`);
             }
 
+      - name: Build Slack payload (remediation complete)
+        id: slack_payload_complete
+        if: steps.postcheck.outputs.exit_code == '0'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          MODE: ${{ inputs.mode }}
+          ACTOR: ${{ github.actor }}
+          REASON: ${{ inputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg env "${ENVIRONMENT}" \
+            --arg mode "${MODE}" \
+            --arg actor "${ACTOR}" \
+            --arg reason "${REASON}" \
+            --arg run_url "${RUN_URL}" \
+            '{
+              text: ("Drift remediated in " + $env + "."),
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: ("*Drift Remediated*\nEnvironment: `" + $env + "`\nMode: `" + $mode + "`\nBy: " + $actor + "\nReason: " + $reason + "\n<" + $run_url + "|View run>")
+                  }
+                }
+              ]
+            }')
+          {
+            echo "payload<<SLACK_PAYLOAD_EOF"
+            echo "${PAYLOAD}"
+            echo "SLACK_PAYLOAD_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Slack notification (remediation complete)
         if: steps.postcheck.outputs.exit_code == '0'
         uses: slackapi/slack-github-action@v2.0.0
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
-          payload: |
-            {
-              "text": "Drift remediated in ${{ inputs.environment }}.",
-              "blocks": [
+          payload: ${{ steps.slack_payload_complete.outputs.payload }}
+
+      - name: Build Slack payload (drift persists)
+        id: slack_payload_persists
+        if: steps.postcheck.outputs.exit_code != '0' && steps.postcheck.outputs.exit_code != ''
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          MODE: ${{ inputs.mode }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg env "${ENVIRONMENT}" \
+            --arg mode "${MODE}" \
+            --arg actor "${ACTOR}" \
+            --arg run_url "${RUN_URL}" \
+            '{
+              text: ("Remediation incomplete. Drift persists in " + $env + ". Manual investigation required."),
+              blocks: [
                 {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Drift Remediated*\nEnvironment: `${{ inputs.environment }}`\nMode: `${{ inputs.mode }}`\nBy: ${{ github.actor }}\nReason: ${{ inputs.reason }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: ("*Remediation Incomplete*\nEnvironment: `" + $env + "`\nDrift still detected after `" + $mode + "` by " + $actor + ".\n<" + $run_url + "|View run logs>")
                   }
                 }
               ]
-            }
+            }')
+          {
+            echo "payload<<SLACK_PAYLOAD_EOF"
+            echo "${PAYLOAD}"
+            echo "SLACK_PAYLOAD_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Slack notification (drift persists)
         if: steps.postcheck.outputs.exit_code != '0' && steps.postcheck.outputs.exit_code != ''
@@ -242,16 +328,4 @@ jobs:
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
-          payload: |
-            {
-              "text": "Remediation incomplete. Drift persists in ${{ inputs.environment }}. Manual investigation required.",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Remediation Incomplete*\nEnvironment: `${{ inputs.environment }}`\nDrift still detected after `${{ inputs.mode }}` by ${{ github.actor }}.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run logs>"
-                  }
-                }
-              ]
-            }
+          payload: ${{ steps.slack_payload_persists.outputs.payload }}
